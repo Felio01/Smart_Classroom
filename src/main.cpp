@@ -25,8 +25,7 @@
 // =====================================================================
 // TUNING — sesuaikan sesuai kondisi ruangan
 // =====================================================================
-#define LUX_ON_THRESHOLD          173.0f   // lux > ini = proyektor ON
-#define LUX_OFF_THRESHOLD         172.0f   // lux < ini = proyektor OFF
+#define LUX_THRESHOLD             172.0f   // lux > ini = ON, lux <= ini = OFF
 
 #define IR_SEND_INTERVAL          15000UL  // jeda antar kirim IR retry (ms)
 #define IR_MAX_RETRY              5        // max retry IR sebelum berhenti
@@ -339,7 +338,6 @@ void sendIROn() {
   irsend.sendNEC(IR_CODE_1, 32);
   delay(100);
   irsend.sendNEC(IR_CODE_2, 32);
-  Serial.println("IR: ON sent");
 }
 
 void sendIROff() {
@@ -350,7 +348,6 @@ void sendIROff() {
   irsend.sendNEC(IR_CODE_1, 32);
   delay(100);
   irsend.sendNEC(IR_CODE_2, 32);
-  Serial.println("IR: OFF sent");
 }
 
 // Mulai proses kirim IR ON
@@ -389,7 +386,7 @@ void fetchLampBaseline() {
   http.begin(url);
   http.addHeader("apikey", SUPABASE_API_KEY);
   http.addHeader("Authorization", String("Bearer ") + SUPABASE_API_KEY);
-  http.setTimeout(5000);
+  http.setTimeout(10000);
   int code = http.GET();
   if (code == 200) {
     DynamicJsonDocument doc(256);
@@ -410,34 +407,38 @@ void fetchLampBaseline() {
 }
 
 // =====================================================================
-// SUPABASE — UPSERT LAMP USAGE
+// SUPABASE — UPDATE LAMP USAGE (PATCH)
 // =====================================================================
 void upsertLampUsage() {
   if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("Lamp upsert skip: no WiFi");
+    Serial.println("Lamp update skip: no WiFi");
     return;
   }
   uint32_t totalMin = lampBaselineMin + lampTodayMin;
-  StaticJsonDocument<256> doc;
-  doc["classroom"]      = TARGET_CLASSROOM;
+
+  StaticJsonDocument<128> doc;
   doc["lamphour_usage"] = totalMin;
-  doc["date"]           = getTodayDate();
   String body;
   serializeJson(doc, body);
+
+  String url = String(SUPABASE_URL) + "/rest/v1/" + TABLE_LAMPUSAGE +
+               "?classroom=eq." + TARGET_CLASSROOM;
+
   HTTPClient http;
-  http.begin(String(SUPABASE_URL) + "/rest/v1/" + TABLE_LAMPUSAGE);
+  http.begin(url);
   http.addHeader("apikey", SUPABASE_API_KEY);
   http.addHeader("Authorization", String("Bearer ") + SUPABASE_API_KEY);
   http.addHeader("Content-Type", "application/json");
-  http.addHeader("Prefer", "resolution=merge-duplicates,return=minimal");
-  int code = http.POST(body);
-  if (code == 200 || code == 201 || code == 204) {
+  http.addHeader("Prefer", "return=minimal");
+  int code = http.PATCH(body);
+
+  if (code == 200 || code == 204) {
     lampBaselineMin = totalMin;
     saveLampBaseline(lampBaselineMin);
-    Serial.printf("Lamp upsert OK: %u min total (%u today)\n",
+    Serial.printf("Lamp update OK: %u min total (%u today)\n",
       totalMin, lampTodayMin);
   } else {
-    Serial.printf("Lamp upsert failed: HTTP %d\n", code);
+    Serial.printf("Lamp update failed: HTTP %d\n", code);
   }
   http.end();
 }
@@ -629,9 +630,8 @@ void setup() {
 
   Serial.printf("Ready | %s | Room: %s\n",
     DEBUG_MODE ? "DEBUG" : "PRODUCTION", TARGET_CLASSROOM);
-  Serial.printf("Lux ON:%.0f OFF:%.0f | IR retry: %lus x%d\n",
-    LUX_ON_THRESHOLD, LUX_OFF_THRESHOLD,
-    IR_SEND_INTERVAL / 1000, IR_MAX_RETRY);
+  Serial.printf("Lux threshold:%.0f | IR retry: %lus x%d\n",
+    LUX_THRESHOLD, IR_SEND_INTERVAL / 1000, IR_MAX_RETRY);
   Serial.printf("Presence threshold:%d timeout:%dmin check:%lus\n",
     PRESENCE_ENERGY_THRESHOLD, PRESENCE_TIMEOUT_MIN,
     PRESENCE_CHECK_INTERVAL / 1000);
@@ -674,12 +674,7 @@ void loop() {
 
     // --- BH1750 sebagai sumber kebenaran status proyektor ---
     bool prevOn = projectorOn;
-    if (lux > LUX_ON_THRESHOLD) {
-      projectorOn = true;
-    } else if (lux < LUX_OFF_THRESHOLD) {
-      projectorOn = false;
-    }
-    // Di antara threshold: hysteresis, status tidak berubah
+    projectorOn = (lux > LUX_THRESHOLD);
 
     // Deteksi proyektor baru menyala → catat waktu mulai lamp
     if (projectorOn && !prevOn) {
@@ -698,8 +693,8 @@ void loop() {
 
     // --- Verifikasi IR yang sedang pending ---
     if (irSending) {
-      bool confirmed = irTargetOn ? (lux > LUX_ON_THRESHOLD)
-                                  : (lux < LUX_OFF_THRESHOLD);
+      bool confirmed = irTargetOn ? (lux > LUX_THRESHOLD)
+                                  : (lux <= LUX_THRESHOLD);
       if (confirmed) {
         Serial.printf("IR %s confirmed (lux=%.1f)\n",
           irTargetOn ? "ON" : "OFF", lux);
@@ -810,8 +805,6 @@ void loop() {
       Serial.println("Day complete, waiting for tomorrow");
     }
   }
-
-
 
   delay(1000);
 }
