@@ -27,21 +27,35 @@
 // =====================================================================
 #define LUX_THRESHOLD             172.0f   // lux > ini = ON, lux <= ini = OFF
 
-#define IR_SEND_INTERVAL          15000UL  // jeda antar kirim IR retry (ms)
+#define IR_SEND_INTERVAL          15000UL  // jeda antar retry IR (ms) 
 #define IR_MAX_RETRY              5        // max retry IR sebelum berhenti
 
-#define PRESENCE_ENERGY_THRESHOLD 25       // energy LD2410C = ada orang
+// Set 1 = presence aktif, 0 = dinonaktifkan (troubleshoot)
+#define ENABLE_PRESENCE           1
+
+#define PRESENCE_ENERGY_THRESHOLD 25       // energy minimum = ada orang
 #define PRESENCE_CHECK_INTERVAL   30000UL  // interval cek ulang presence (ms)
 #define PRESENCE_TIMEOUT_MIN      15       // batas waktu tunggu orang (menit)
 
-#define SENSOR_READ_INTERVAL      5000UL   // baca BH1750+AHT10 tiap n ms
-#define SENSOR_BUFFER_SIZE        60       // 60 x 5 detik = 5 menit → average
+#define SENSOR_READ_INTERVAL      5000UL   // baca sensor tiap n ms
+#define SENSOR_BUFFER_SIZE        60       // 60 x 5 detik = 5 menit -> average
+
+// =====================================================================
+// NTP
+// =====================================================================
+#define NTP_RETRY_INTERVAL        60000UL    // retry NTP tiap 1 menit jika gagal
+#define NTP_RESYNC_INTERVAL       3600000UL  // re-sync NTP tiap 1 jam
+
+// =====================================================================
+// LAMP USAGE RETRY
+// =====================================================================
+#define LAMP_RETRY_INTERVAL       300000UL   // retry lamp update tiap 5 menit
 
 // =====================================================================
 // WiFi
 // =====================================================================
-const char* SSID     = "Felio";
-const char* PASSWORD = "felio150";
+const char* SSID     = "CEIOT";
+const char* PASSWORD = "CE-1OT@!";
 
 // =====================================================================
 // SUPABASE
@@ -51,7 +65,7 @@ const char* SUPABASE_API_KEY = "sb_publishable_9AcAocwpvzIqNdhlP05Jtg_U4PK63gT";
 const char* TABLE_SCHEDULE   = "tbl_jadwalkelas";
 const char* TABLE_LAMPUSAGE  = "tbl_lampusage";
 const char* TABLE_SENSORDATA = "tbl_dataprojector";
-const char* TARGET_CLASSROOM = "HD03";
+const char* TARGET_CLASSROOM = "HD04";
 
 // =====================================================================
 // MQTT
@@ -62,7 +76,7 @@ const char* MQTT_TOPIC_SENSOR  = "sensor/data/thesis";
 const char* MQTT_TOPIC_REFETCH = "thesis/refetch_schedule";
 
 // =====================================================================
-// NTP
+// NTP CONFIG
 // =====================================================================
 const char* NTP_SERVER      = "pool.ntp.org";
 const long  GMT_OFFSET_SEC  = 7 * 3600;
@@ -76,7 +90,7 @@ const int   DAYLIGHT_OFFSET = 0;
 #define EEPROM_SIZE          512
 #define EEPROM_ADDR_DATE     0
 #define EEPROM_ADDR_LAMP     12
-#define FETCH_RETRY_INTERVAL 600000UL  // retry fetch tiap 10 menit
+#define FETCH_RETRY_INTERVAL 600000UL
 
 // =====================================================================
 // DEBUG
@@ -118,32 +132,31 @@ std::vector<ScheduleItem> schedules;
 // STATE
 // =====================================================================
 
-// Proyektor — status dari BH1750 langsung
-bool     projectorOn     = false;
-bool     projectorWasOn  = false;  // untuk deteksi perubahan state lamp usage
+// Proyektor
+bool          projectorOn      = false;
+bool          irSending        = false;
+bool          irTargetOn       = false;
+int           irRetryCount     = 0;
+unsigned long irLastSent       = 0;
 
-// IR
-bool          irSending      = false;   // sedang dalam proses kirim IR
-bool          irTargetOn     = false;   // tujuan IR: true=ON, false=OFF
-int           irRetryCount   = 0;
-unsigned long irLastSent     = 0;
-
-// Presence window
-bool          presenceWindowActive  = false;  // sedang dalam window cek presence
-bool          presenceFound         = false;  // orang sudah ditemukan
-unsigned long presenceWindowStart   = 0;      // kapan window dimulai
-unsigned long lastPresenceCheck     = 0;
+// Presence
+bool          presenceWindowActive = false;
+bool          presenceFound        = false;
+unsigned long presenceWindowStart  = 0;
+unsigned long lastPresenceCheck    = 0;
 
 // Lamp usage
 uint32_t      lampBaselineMin  = 0;
 uint32_t      lampTodayMin     = 0;
-unsigned long lampOnStart      = 0;   // millis() saat projectorOn jadi true
+unsigned long lampOnStart      = 0;
 bool          pendingUpsert    = false;
+bool          lampUpsertFailed = false;
+unsigned long lastLampRetry    = 0;
 
-// Sensor buffer (hanya saat proyektor ON)
+// Sensor buffer
 float         tempBuffer[SENSOR_BUFFER_SIZE];
 float         humBuffer[SENSOR_BUFFER_SIZE];
-int           bufferIdx  = 0;
+int           bufferIdx        = 0;
 
 // Schedule fetch
 bool          fetchedToday     = false;
@@ -154,6 +167,8 @@ bool          timeSync          = false;
 unsigned long lastSensorRead    = 0;
 unsigned long lastMQTTReconnect = 0;
 unsigned long lastWiFiCheck     = 0;
+unsigned long lastNTPAttempt    = 0;
+unsigned long lastNTPResync     = 0;
 
 // =====================================================================
 // HELPERS
@@ -263,13 +278,11 @@ void maintainWiFi() {
   if (millis() - lastWiFiCheck < 30000) return;
   lastWiFiCheck = millis();
   if (WiFi.status() == WL_CONNECTED) return;
-
   Serial.print("WiFi lost, reconnecting");
   setLED(PIN_LED_WIFI, false);
   WiFi.disconnect();
   delay(500);
   WiFi.begin(SSID, PASSWORD);
-
   int attempts = 0;
   while (WiFi.status() != WL_CONNECTED && attempts < 20) {
     delay(500);
@@ -285,7 +298,7 @@ void maintainWiFi() {
 }
 
 // =====================================================================
-// NTP
+// NTP — initial sync + retry + resync berkala
 // =====================================================================
 void syncNTP() {
   configTime(GMT_OFFSET_SEC, DAYLIGHT_OFFSET, NTP_SERVER);
@@ -299,13 +312,39 @@ void syncNTP() {
     attempts++;
   }
   if (now > 24 * 3600) {
-    timeSync = true;
+    timeSync      = true;
+    lastNTPResync = millis();
     setLED(PIN_LED_NTP, true);
     Serial.println("\nNTP OK: " + getTimestamp());
   } else {
     timeSync = false;
     setLED(PIN_LED_NTP, false);
-    Serial.println("\nNTP failed");
+    Serial.println("\nNTP failed, will retry in background");
+  }
+}
+
+void maintainNTP() {
+  if (!timeSync) {
+    if (millis() - lastNTPAttempt < NTP_RETRY_INTERVAL) return;
+    lastNTPAttempt = millis();
+    if (WiFi.status() != WL_CONNECTED) return;
+    configTime(GMT_OFFSET_SEC, DAYLIGHT_OFFSET, NTP_SERVER);
+    delay(500);
+    if (time(nullptr) > 24 * 3600) {
+      timeSync      = true;
+      lastNTPResync = millis();
+      setLED(PIN_LED_NTP, true);
+      Serial.println("NTP recovered: " + getTimestamp());
+    } else {
+      Serial.println("NTP retry failed, next in 1 min");
+    }
+    return;
+  }
+  if (millis() - lastNTPResync >= NTP_RESYNC_INTERVAL) {
+    lastNTPResync = millis();
+    if (WiFi.status() != WL_CONNECTED) return;
+    configTime(GMT_OFFSET_SEC, DAYLIGHT_OFFSET, NTP_SERVER);
+    Serial.println("NTP resync: " + getTimestamp());
   }
 }
 
@@ -313,22 +352,41 @@ void syncNTP() {
 // PRESENCE SENSOR
 // =====================================================================
 void initPresenceSensor() {
+#if ENABLE_PRESENCE
   sensorSerial.begin(256000, SERIAL_8N1, PIN_SENSOR_RX, PIN_SENSOR_TX);
   delay(500);
   presenceSensor.begin(sensorSerial, false);
   Serial.println("LD2410C initialized");
+#else
+  Serial.println("LD2410C disabled (ENABLE_PRESENCE=0)");
+#endif
+}
+
+void pollPresenceSensor() {
+#if ENABLE_PRESENCE
+  presenceSensor.read();
+#endif
 }
 
 bool readPresence() {
+#if ENABLE_PRESENCE
+  unsigned long t = millis();
+  while (millis() - t < 500) {
+    presenceSensor.read();
+    delay(10);
+  }
   presenceSensor.read();
-  if (!presenceSensor.presenceDetected()) return false;
   uint8_t movE  = presenceSensor.movingTargetEnergy();
   uint8_t statE = presenceSensor.stationaryTargetEnergy();
   bool detected = (movE > PRESENCE_ENERGY_THRESHOLD) ||
                   (statE > PRESENCE_ENERGY_THRESHOLD);
-  Serial.printf("Presence read: mov=%d stat=%d -> %s\n",
+  Serial.printf("Presence: mov=%d stat=%d -> %s\n",
     movE, statE, detected ? "DETECTED" : "EMPTY");
   return detected;
+#else
+  Serial.println("Presence disabled, assuming present");
+  return true;
+#endif
 }
 
 // =====================================================================
@@ -344,13 +402,12 @@ void sendIROff() {
   irsend.sendNEC(IR_CODE_1, 32);
   delay(100);
   irsend.sendNEC(IR_CODE_2, 32);
-  delay(3000);
+  delay(4000);
   irsend.sendNEC(IR_CODE_1, 32);
   delay(100);
   irsend.sendNEC(IR_CODE_2, 32);
 }
 
-// Mulai proses kirim IR ON
 void startIROn() {
   Serial.println("IR: ON sent");
   sendIROn();
@@ -360,7 +417,6 @@ void startIROn() {
   irLastSent   = millis();
 }
 
-// Mulai proses kirim IR OFF
 void startIROff() {
   Serial.println("IR: OFF sent");
   sendIROff();
@@ -386,7 +442,7 @@ void fetchLampBaseline() {
   http.begin(url);
   http.addHeader("apikey", SUPABASE_API_KEY);
   http.addHeader("Authorization", String("Bearer ") + SUPABASE_API_KEY);
-  http.setTimeout(10000);
+  http.setTimeout(5000);
   int code = http.GET();
   if (code == 200) {
     DynamicJsonDocument doc(256);
@@ -412,18 +468,16 @@ void fetchLampBaseline() {
 void upsertLampUsage() {
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("Lamp update skip: no WiFi");
+    lampUpsertFailed = true;
     return;
   }
   uint32_t totalMin = lampBaselineMin + lampTodayMin;
-
   StaticJsonDocument<128> doc;
   doc["lamphour_usage"] = totalMin;
   String body;
   serializeJson(doc, body);
-
   String url = String(SUPABASE_URL) + "/rest/v1/" + TABLE_LAMPUSAGE +
                "?classroom=eq." + TARGET_CLASSROOM;
-
   HTTPClient http;
   http.begin(url);
   http.addHeader("apikey", SUPABASE_API_KEY);
@@ -431,20 +485,31 @@ void upsertLampUsage() {
   http.addHeader("Content-Type", "application/json");
   http.addHeader("Prefer", "return=minimal");
   int code = http.PATCH(body);
-
   if (code == 200 || code == 204) {
-    lampBaselineMin = totalMin;
+    lampBaselineMin  = totalMin;
     saveLampBaseline(lampBaselineMin);
+    lampUpsertFailed = false;
     Serial.printf("Lamp update OK: %u min total (%u today)\n",
       totalMin, lampTodayMin);
   } else {
-    Serial.printf("Lamp update failed: HTTP %d\n", code);
+    lampUpsertFailed = true;
+    Serial.printf("Lamp update failed: HTTP %d, retry in 5 min\n", code);
   }
   http.end();
 }
 
+void maintainLampUsage() {
+  if (!lampUpsertFailed) return;
+  if (WiFi.status() != WL_CONNECTED) return;
+  if (millis() - lastLampRetry < LAMP_RETRY_INTERVAL) return;
+  lastLampRetry = millis();
+  Serial.println("Lamp update retry...");
+  upsertLampUsage();
+}
+
 // =====================================================================
 // SUPABASE — INSERT SENSOR AVERAGE (tiap 5 menit)
+// Kolom tbl_dataprojector: temp, humid, classroom, created_at (auto)
 // =====================================================================
 void insertSensorAverage() {
   if (WiFi.status() != WL_CONNECTED || bufferIdx == 0) return;
@@ -453,13 +518,17 @@ void insertSensorAverage() {
     sumTemp += tempBuffer[i];
     sumHum  += humBuffer[i];
   }
+  float avgTemp = sumTemp / bufferIdx;
+  float avgHum  = sumHum  / bufferIdx;
+
+  // Kolom disesuaikan dengan struktur tabel: temp, humid, classroom
   StaticJsonDocument<256> doc;
-  doc["classroom"]   = TARGET_CLASSROOM;
-  doc["temperature"] = (int)round(sumTemp / bufferIdx);
-  doc["humidity"]    = (int)round(sumHum  / bufferIdx);
-  doc["timestamp"]   = getTimestamp();
+  doc["classroom"] = TARGET_CLASSROOM;
+  doc["temp"]      = round(avgTemp * 10) / 10.0;  // 1 desimal
+  doc["humid"]     = round(avgHum  * 10) / 10.0;
   String body;
   serializeJson(doc, body);
+
   HTTPClient http;
   http.begin(String(SUPABASE_URL) + "/rest/v1/" + TABLE_SENSORDATA);
   http.addHeader("apikey", SUPABASE_API_KEY);
@@ -467,8 +536,8 @@ void insertSensorAverage() {
   http.addHeader("Content-Type", "application/json");
   http.addHeader("Prefer", "return=minimal");
   int code = http.POST(body);
-  Serial.printf("Sensor avg insert: temp=%d hum=%d HTTP %d\n",
-    (int)round(sumTemp / bufferIdx), (int)round(sumHum / bufferIdx), code);
+  Serial.printf("Sensor avg: temp=%.1f humid=%.1f HTTP %d\n",
+    avgTemp, avgHum, code);
   http.end();
   bufferIdx = 0;
 }
@@ -496,10 +565,10 @@ void fetchSchedule() {
   if (code == 200) {
     DynamicJsonDocument doc(4096);
     if (!deserializeJson(doc, http.getString())) {
-      // Clear RAM sebelum isi data baru
       schedules.clear();
       lampTodayMin          = 0;
       pendingUpsert         = false;
+      lampUpsertFailed      = false;
       presenceWindowActive  = false;
       presenceFound         = false;
       bufferIdx             = 0;
@@ -578,15 +647,13 @@ void publishSensorData(float lux, float temp, float hum) {
      "\"status\":\"%s\","
      "\"presence\":%s,"
      "\"lux\":%.1f,"
-     "\"temperature\":%d,"
-     "\"humidity\":%d,"
+     "\"temperature\":%.1f,"
+     "\"humidity\":%.1f,"
      "\"timestamp\":\"%s\"}",
     TARGET_CLASSROOM,
     projectorOn ? "ON" : "OFF",
     presenceFound ? "true" : "false",
-    lux,
-    (int)round(temp),
-    (int)round(hum),
+    lux, temp, hum,
     getTimestamp().c_str());
   mqttClient.publish(MQTT_TOPIC_SENSOR, payload);
   Serial.println(payload);
@@ -630,21 +697,27 @@ void setup() {
 
   Serial.printf("Ready | %s | Room: %s\n",
     DEBUG_MODE ? "DEBUG" : "PRODUCTION", TARGET_CLASSROOM);
-  Serial.printf("Lux threshold:%.0f | IR retry: %lus x%d\n",
+  Serial.printf("Lux threshold:%.0f | IR retry:%lus x%d\n",
     LUX_THRESHOLD, IR_SEND_INTERVAL / 1000, IR_MAX_RETRY);
-  Serial.printf("Presence threshold:%d timeout:%dmin check:%lus\n",
+  Serial.printf("Presence:%s threshold:%d timeout:%dmin check:%lus\n",
+    ENABLE_PRESENCE ? "ON" : "OFF",
     PRESENCE_ENERGY_THRESHOLD, PRESENCE_TIMEOUT_MIN,
     PRESENCE_CHECK_INTERVAL / 1000);
+  Serial.printf("NTP retry:%lus resync:%lus | Lamp retry:%lus\n",
+    NTP_RETRY_INTERVAL / 1000,
+    NTP_RESYNC_INTERVAL / 1000,
+    LAMP_RETRY_INTERVAL / 1000);
 }
 
 // =====================================================================
 // LOOP
 // =====================================================================
 void loop() {
-  // WiFi auto-reconnect
+  pollPresenceSensor();
   maintainWiFi();
+  maintainNTP();
+  maintainLampUsage();
 
-  // MQTT keepalive
   if (WiFi.status() == WL_CONNECTED) {
     if (!mqttClient.connected()) {
       if (millis() - lastMQTTReconnect > 10000) {
@@ -656,7 +729,6 @@ void loop() {
     }
   }
 
-  // Fetch jadwal jika perlu
   if (timeSync && shouldFetch()) {
     fetchSchedule();
     if (!DEBUG_MODE) delay(60000);
@@ -672,17 +744,14 @@ void loop() {
     float temp = aht10.readTemperature();
     float hum  = aht10.readHumidity();
 
-    // --- BH1750 sebagai sumber kebenaran status proyektor ---
+    // BH1750 sebagai sumber kebenaran — satu threshold
     bool prevOn = projectorOn;
     projectorOn = (lux > LUX_THRESHOLD);
 
-    // Deteksi proyektor baru menyala → catat waktu mulai lamp
     if (projectorOn && !prevOn) {
       lampOnStart = millis();
       Serial.printf("Projector ON (lux=%.1f)\n", lux);
     }
-
-    // Deteksi proyektor baru mati → akumulasi lamp usage
     if (!projectorOn && prevOn && lampOnStart > 0) {
       uint32_t sessionMin = (millis() - lampOnStart) / 60000UL;
       lampTodayMin += sessionMin;
@@ -691,7 +760,7 @@ void loop() {
         lux, sessionMin, lampTodayMin);
     }
 
-    // --- Verifikasi IR yang sedang pending ---
+    // Verifikasi IR pending
     if (irSending) {
       bool confirmed = irTargetOn ? (lux > LUX_THRESHOLD)
                                   : (lux <= LUX_THRESHOLD);
@@ -714,22 +783,19 @@ void loop() {
       }
     }
 
-    // --- Buffer sensor (hanya saat proyektor ON) ---
+    // Buffer sensor — hanya saat proyektor ON
     if (projectorOn && !isnan(temp) && !isnan(hum)) {
       tempBuffer[bufferIdx] = temp;
       humBuffer[bufferIdx]  = hum;
       bufferIdx++;
-      if (bufferIdx >= SENSOR_BUFFER_SIZE) {
-        insertSensorAverage();  // reset bufferIdx di dalamnya
-      }
+      if (bufferIdx >= SENSOR_BUFFER_SIZE)
+        insertSensorAverage();
     }
 
-    // --- Log ringkas ---
-    Serial.printf("lux=%.1f temp=%d hum=%d proj=%s today=%umin\n",
-      lux, (int)round(temp), (int)round(hum),
+    Serial.printf("lux=%.1f temp=%.1f hum=%.1f proj=%s today=%umin\n",
+      lux, temp, hum,
       projectorOn ? "ON" : "OFF", lampTodayMin);
 
-    // --- Publish MQTT ---
     if (!isnan(temp) && !isnan(hum))
       publishSensorData(lux, temp, hum);
   }
@@ -738,15 +804,9 @@ void loop() {
   // LOGIKA JADWAL + PRESENCE (tiap detik)
   // ---------------------------------------------------------------
   if (timeSync && !schedules.empty()) {
-    int nowMin = nowInMinutes();
-
     for (const auto& s : schedules) {
-      int startMin = timeToMinutes(s.start_time);
-      int endMin   = timeToMinutes(s.end_time);
-
-      // === START TIME: mulai window cek presence ===
       if (isTimeMatch(s.start_time) && !presenceWindowActive && !projectorOn) {
-        Serial.printf("Start time match: %s | Opening presence window\n",
+        Serial.printf("Start: %s | Opening presence window\n",
           s.mata_kuliah.c_str());
         presenceWindowActive = true;
         presenceFound        = false;
@@ -755,50 +815,40 @@ void loop() {
         break;
       }
 
-      // === END TIME: matikan proyektor ===
       if (isTimeMatch(s.end_time)) {
-        Serial.printf("End time match: %s | Sending IR OFF\n",
-          s.mata_kuliah.c_str());
+        Serial.printf("End: %s | IR OFF\n", s.mata_kuliah.c_str());
         presenceWindowActive = false;
         presenceFound        = false;
         if (projectorOn || irSending) startIROff();
-
-        // Jadwal terakhir → tandai upsert
         if (s.end_time == getLastEndTime() && !pendingUpsert) {
           pendingUpsert = true;
-          Serial.println("Last schedule, pending lamp upsert");
+          Serial.println("Last schedule, pending lamp update");
         }
         delay(1000);
         break;
       }
     }
 
-    // === PRESENCE WINDOW: cek LD2410C tiap 30 detik ===
     if (presenceWindowActive && !presenceFound && !projectorOn) {
-      // Cek timeout window (15 menit dari start_time)
       unsigned long elapsed = millis() - presenceWindowStart;
       if (elapsed > (unsigned long)PRESENCE_TIMEOUT_MIN * 60000UL) {
         presenceWindowActive = false;
-        Serial.printf("Presence timeout (%d min), no one found\n",
-          PRESENCE_TIMEOUT_MIN);
-      }
-      // Cek presence tiap interval
-      else if (millis() - lastPresenceCheck >= PRESENCE_CHECK_INTERVAL) {
+        Serial.printf("Presence timeout (%d min)\n", PRESENCE_TIMEOUT_MIN);
+      } else if (millis() - lastPresenceCheck >= PRESENCE_CHECK_INTERVAL) {
         lastPresenceCheck = millis();
         presenceFound     = readPresence();
         if (presenceFound) {
-          Serial.println("Person detected, sending IR ON");
+          Serial.println("Person detected, IR ON");
           startIROn();
           presenceWindowActive = false;
         } else {
-          unsigned long remaining = ((unsigned long)PRESENCE_TIMEOUT_MIN * 60000UL - elapsed) / 1000;
+          unsigned long rem = ((unsigned long)PRESENCE_TIMEOUT_MIN * 60000UL - elapsed) / 1000;
           Serial.printf("No presence, retry in %lus (%lus remaining)\n",
-            PRESENCE_CHECK_INTERVAL / 1000, remaining);
+            PRESENCE_CHECK_INTERVAL / 1000, rem);
         }
       }
     }
 
-    // === UPSERT setelah proyektor OFF confirmed ===
     if (pendingUpsert && !projectorOn && !irSending) {
       upsertLampUsage();
       pendingUpsert = false;
