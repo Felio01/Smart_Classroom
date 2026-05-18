@@ -23,39 +23,44 @@
 #define PIN_SENSOR_TX   21
 
 // =====================================================================
-// TUNING — sesuaikan sesuai kondisi ruangan
+// TUNING
 // =====================================================================
-#define LUX_THRESHOLD             172.0f   // lux > ini = ON, lux <= ini = OFF
+#define LUX_THRESHOLD             220.0f
 
-#define IR_SEND_INTERVAL          15000UL  // jeda antar retry IR (ms) 
-#define IR_MAX_RETRY              5        // max retry IR sebelum berhenti
+#define IR_SEND_INTERVAL          15000UL
+#define IR_MAX_RETRY              5
 
 // Set 1 = presence aktif, 0 = dinonaktifkan (troubleshoot)
 #define ENABLE_PRESENCE           1
 
-#define PRESENCE_ENERGY_THRESHOLD 25       // energy minimum = ada orang
-#define PRESENCE_CHECK_INTERVAL   30000UL  // interval cek ulang presence (ms)
-#define PRESENCE_TIMEOUT_MIN      15       // batas waktu tunggu orang (menit)
+#define PRESENCE_ENERGY_THRESHOLD 25
+#define PRESENCE_CHECK_INTERVAL   30000UL  // cek tiap 30 detik
+#define PRESENCE_TIMEOUT_MIN      15       // maks tunggu orang saat start (menit)
+#define END_WINDOW_TIMEOUT_MIN    15       // maks toleransi setelah end_time (menit)
 
-#define SENSOR_READ_INTERVAL      5000UL   // baca sensor tiap n ms
-#define SENSOR_BUFFER_SIZE        60       // 60 x 5 detik = 5 menit -> average
+#define SENSOR_READ_INTERVAL      5000UL
+#define SENSOR_BUFFER_SIZE        60
 
 // =====================================================================
 // NTP
 // =====================================================================
-#define NTP_RETRY_INTERVAL        60000UL    // retry NTP tiap 1 menit jika gagal
-#define NTP_RESYNC_INTERVAL       3600000UL  // re-sync NTP tiap 1 jam
+#define NTP_RETRY_INTERVAL        30000UL 
+#define NTP_RESYNC_INTERVAL       3600000UL
 
 // =====================================================================
 // LAMP USAGE RETRY
 // =====================================================================
-#define LAMP_RETRY_INTERVAL       300000UL   // retry lamp update tiap 5 menit
+#define LAMP_RETRY_INTERVAL       300000UL
 
 // =====================================================================
 // WiFi
 // =====================================================================
-const char* SSID     = "CEIOT";
-const char* PASSWORD = "CE-1OT@!";
+// const char* SSID     = "CEIOT";
+// const char* PASSWORD = "CE-1OT@!";
+
+const char* SSID     = "Felio";
+const char* PASSWORD = "felio150";
+
 
 // =====================================================================
 // SUPABASE
@@ -65,7 +70,7 @@ const char* SUPABASE_API_KEY = "sb_publishable_9AcAocwpvzIqNdhlP05Jtg_U4PK63gT";
 const char* TABLE_SCHEDULE   = "tbl_jadwalkelas";
 const char* TABLE_LAMPUSAGE  = "tbl_lampusage";
 const char* TABLE_SENSORDATA = "tbl_dataprojector";
-const char* TARGET_CLASSROOM = "HD04";
+const char* TARGET_CLASSROOM = "HD03";
 
 // =====================================================================
 // MQTT
@@ -73,6 +78,7 @@ const char* TARGET_CLASSROOM = "HD04";
 const char* MQTT_BROKER        = "broker.emqx.io";
 const int   MQTT_PORT          = 1883;
 const char* MQTT_TOPIC_SENSOR  = "sensor/data/thesis";
+const char* MQTT_TOPIC_LOG     = "thesis/log";
 const char* MQTT_TOPIC_REFETCH = "thesis/refetch_schedule";
 
 // =====================================================================
@@ -139,11 +145,18 @@ bool          irTargetOn       = false;
 int           irRetryCount     = 0;
 unsigned long irLastSent       = 0;
 
-// Presence
-bool          presenceWindowActive = false;
-bool          presenceFound        = false;
-unsigned long presenceWindowStart  = 0;
-unsigned long lastPresenceCheck    = 0;
+// Presence — polling terus, hasil selalu fresh
+bool          presenceNow      = false;  // status terkini dari poll
+
+// Start window — tunggu orang untuk nyalakan
+bool          startWindowActive = false;
+unsigned long startWindowStart  = 0;
+unsigned long lastStartCheck    = 0;
+
+// End window — tunggu tidak ada orang untuk matikan
+bool          endWindowActive   = false;
+unsigned long endWindowStart    = 0;
+unsigned long lastEndCheck      = 0;
 
 // Lamp usage
 uint32_t      lampBaselineMin  = 0;
@@ -213,8 +226,22 @@ String getLastEndTime() {
   return latest;
 }
 
-void setLED(uint8_t pin, bool on) {
-  digitalWrite(pin, on ? LOW : HIGH);
+void setLED(uint8_t pin, bool problem) {
+  // LED nyala = ada masalah (active LOW)
+  digitalWrite(pin, problem ? HIGH : LOW);
+}
+
+// =====================================================================
+// MQTT LOG 
+// =====================================================================
+void publishLog(const String& msg) {
+  if (!mqttClient.connected()) {
+    Serial.println("[LOG] " + msg);
+    return;
+  }
+  String payload = "[" + getTimestamp() + "] " + msg;
+  mqttClient.publish(MQTT_TOPIC_LOG, payload.c_str());
+  Serial.println("[LOG] " + payload);
 }
 
 // =====================================================================
@@ -253,7 +280,7 @@ uint32_t loadLampBaseline() {
 }
 
 // =====================================================================
-// WiFi — auto reconnect tanpa reset
+// WiFi
 // =====================================================================
 void connectWiFi() {
   Serial.print("Connecting WiFi");
@@ -266,10 +293,10 @@ void connectWiFi() {
     attempts++;
   }
   if (WiFi.status() == WL_CONNECTED) {
-    setLED(PIN_LED_WIFI, true);
+    setLED(PIN_LED_WIFI, false);
     Serial.println("\nWiFi OK: " + WiFi.localIP().toString());
   } else {
-    setLED(PIN_LED_WIFI, false);
+    setLED(PIN_LED_WIFI, true);
     Serial.println("\nWiFi failed, offline mode");
   }
 }
@@ -279,7 +306,7 @@ void maintainWiFi() {
   lastWiFiCheck = millis();
   if (WiFi.status() == WL_CONNECTED) return;
   Serial.print("WiFi lost, reconnecting");
-  setLED(PIN_LED_WIFI, false);
+  setLED(PIN_LED_WIFI, true);
   WiFi.disconnect();
   delay(500);
   WiFi.begin(SSID, PASSWORD);
@@ -290,15 +317,16 @@ void maintainWiFi() {
     attempts++;
   }
   if (WiFi.status() == WL_CONNECTED) {
-    setLED(PIN_LED_WIFI, true);
+    setLED(PIN_LED_WIFI, false);
     Serial.println("\nWiFi reconnected: " + WiFi.localIP().toString());
   } else {
+    setLED(PIN_LED_WIFI, true);
     Serial.println("\nWiFi reconnect failed, retry in 30s");
   }
 }
 
 // =====================================================================
-// NTP — initial sync + retry + resync berkala
+// NTP
 // =====================================================================
 void syncNTP() {
   configTime(GMT_OFFSET_SEC, DAYLIGHT_OFFSET, NTP_SERVER);
@@ -314,11 +342,11 @@ void syncNTP() {
   if (now > 24 * 3600) {
     timeSync      = true;
     lastNTPResync = millis();
-    setLED(PIN_LED_NTP, true);
+    setLED(PIN_LED_NTP, false);
     Serial.println("\nNTP OK: " + getTimestamp());
   } else {
     timeSync = false;
-    setLED(PIN_LED_NTP, false);
+    setLED(PIN_LED_NTP, true);
     Serial.println("\nNTP failed, will retry in background");
   }
 }
@@ -333,9 +361,10 @@ void maintainNTP() {
     if (time(nullptr) > 24 * 3600) {
       timeSync      = true;
       lastNTPResync = millis();
-      setLED(PIN_LED_NTP, true);
+      setLED(PIN_LED_NTP, false);
       Serial.println("NTP recovered: " + getTimestamp());
     } else {
+      setLED(PIN_LED_NTP, true);
       Serial.println("NTP retry failed, next in 1 min");
     }
     return;
@@ -349,7 +378,7 @@ void maintainNTP() {
 }
 
 // =====================================================================
-// PRESENCE SENSOR
+// HUMAN PRESENCE SENSOR
 // =====================================================================
 void initPresenceSensor() {
 #if ENABLE_PRESENCE
@@ -365,27 +394,16 @@ void initPresenceSensor() {
 void pollPresenceSensor() {
 #if ENABLE_PRESENCE
   presenceSensor.read();
-#endif
-}
-
-bool readPresence() {
-#if ENABLE_PRESENCE
-  unsigned long t = millis();
-  while (millis() - t < 500) {
-    presenceSensor.read();
-    delay(10);
-  }
-  presenceSensor.read();
-  uint8_t movE  = presenceSensor.movingTargetEnergy();
-  uint8_t statE = presenceSensor.stationaryTargetEnergy();
-  bool detected = (movE > PRESENCE_ENERGY_THRESHOLD) ||
+  if (presenceSensor.presenceDetected()) {
+    uint8_t movE  = presenceSensor.movingTargetEnergy();
+    uint8_t statE = presenceSensor.stationaryTargetEnergy();
+    presenceNow = (movE > PRESENCE_ENERGY_THRESHOLD) ||
                   (statE > PRESENCE_ENERGY_THRESHOLD);
-  Serial.printf("Presence: mov=%d stat=%d -> %s\n",
-    movE, statE, detected ? "DETECTED" : "EMPTY");
-  return detected;
+  } else {
+    presenceNow = false;
+  }
 #else
-  Serial.println("Presence disabled, assuming present");
-  return true;
+  presenceNow = true;  // troubleshoot: anggap selalu ada orang
 #endif
 }
 
@@ -409,21 +427,21 @@ void sendIROff() {
 }
 
 void startIROn() {
-  Serial.println("IR: ON sent");
   sendIROn();
   irSending    = true;
   irTargetOn   = true;
   irRetryCount = 0;
   irLastSent   = millis();
+  publishLog("IR ON sent");
 }
 
 void startIROff() {
-  Serial.println("IR: OFF sent");
   sendIROff();
   irSending    = true;
   irTargetOn   = false;
   irRetryCount = 0;
   irLastSent   = millis();
+  publishLog("IR OFF sent");
 }
 
 // =====================================================================
@@ -445,7 +463,7 @@ void fetchLampBaseline() {
   http.setTimeout(5000);
   int code = http.GET();
   if (code == 200) {
-    DynamicJsonDocument doc(256);
+    JsonDocument doc;
     if (!deserializeJson(doc, http.getString()) &&
         doc.as<JsonArray>().size() > 0) {
       lampBaselineMin = doc[0]["lamphour_usage"].as<uint32_t>();
@@ -472,7 +490,7 @@ void upsertLampUsage() {
     return;
   }
   uint32_t totalMin = lampBaselineMin + lampTodayMin;
-  StaticJsonDocument<128> doc;
+  JsonDocument doc;
   doc["lamphour_usage"] = totalMin;
   String body;
   serializeJson(doc, body);
@@ -489,11 +507,11 @@ void upsertLampUsage() {
     lampBaselineMin  = totalMin;
     saveLampBaseline(lampBaselineMin);
     lampUpsertFailed = false;
-    Serial.printf("Lamp update OK: %u min total (%u today)\n",
-      totalMin, lampTodayMin);
+    publishLog("Lamp update OK: " + String(totalMin) + " min total (" +
+               String(lampTodayMin) + " today)");
   } else {
     lampUpsertFailed = true;
-    Serial.printf("Lamp update failed: HTTP %d, retry in 5 min\n", code);
+    publishLog("Lamp update failed HTTP " + String(code) + ", retry in 5 min");
   }
   http.end();
 }
@@ -503,13 +521,12 @@ void maintainLampUsage() {
   if (WiFi.status() != WL_CONNECTED) return;
   if (millis() - lastLampRetry < LAMP_RETRY_INTERVAL) return;
   lastLampRetry = millis();
-  Serial.println("Lamp update retry...");
+  publishLog("Lamp update retry...");
   upsertLampUsage();
 }
 
 // =====================================================================
 // SUPABASE — INSERT SENSOR AVERAGE (tiap 5 menit)
-// Kolom tbl_dataprojector: temp, humid, classroom, created_at (auto)
 // =====================================================================
 void insertSensorAverage() {
   if (WiFi.status() != WL_CONNECTED || bufferIdx == 0) return;
@@ -520,15 +537,12 @@ void insertSensorAverage() {
   }
   float avgTemp = sumTemp / bufferIdx;
   float avgHum  = sumHum  / bufferIdx;
-
-  // Kolom disesuaikan dengan struktur tabel: temp, humid, classroom
-  StaticJsonDocument<256> doc;
+  JsonDocument doc;
   doc["classroom"] = TARGET_CLASSROOM;
-  doc["temp"]      = round(avgTemp * 10) / 10.0;  // 1 desimal
+  doc["temp"]      = round(avgTemp * 10) / 10.0;
   doc["humid"]     = round(avgHum  * 10) / 10.0;
   String body;
   serializeJson(doc, body);
-
   HTTPClient http;
   http.begin(String(SUPABASE_URL) + "/rest/v1/" + TABLE_SENSORDATA);
   http.addHeader("apikey", SUPABASE_API_KEY);
@@ -548,7 +562,7 @@ void insertSensorAverage() {
 void fetchSchedule() {
   lastFetchAttempt = millis();
   if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("Fetch skip: no WiFi");
+    publishLog("Fetch skip: no WiFi");
     return;
   }
   String today = getTodayDate();
@@ -563,15 +577,15 @@ void fetchSchedule() {
   http.setTimeout(5000);
   int code = http.GET();
   if (code == 200) {
-    DynamicJsonDocument doc(4096);
+    JsonDocument doc;
     if (!deserializeJson(doc, http.getString())) {
       schedules.clear();
-      lampTodayMin          = 0;
-      pendingUpsert         = false;
-      lampUpsertFailed      = false;
-      presenceWindowActive  = false;
-      presenceFound         = false;
-      bufferIdx             = 0;
+      lampTodayMin        = 0;
+      pendingUpsert       = false;
+      lampUpsertFailed    = false;
+      startWindowActive   = false;
+      endWindowActive     = false;
+      bufferIdx           = 0;
       Serial.println("RAM cleared, loading new schedule");
       for (JsonObject item : doc.as<JsonArray>()) {
         ScheduleItem s;
@@ -584,15 +598,15 @@ void fetchSchedule() {
         Serial.printf("Schedule: %s %s-%s\n",
           s.mata_kuliah.c_str(), s.start_time.c_str(), s.end_time.c_str());
       }
-      Serial.printf("Schedules: %d | Last end: %s\n",
-        schedules.size(), getLastEndTime().c_str());
+      publishLog("Schedule fetched: " + String(schedules.size()) +
+                 " jadwal | Last end: " + getLastEndTime());
       saveFetchDate(today);
       fetchedToday = true;
     } else {
-      Serial.println("Fetch error: JSON parse failed");
+      publishLog("Fetch error: JSON parse failed");
     }
   } else {
-    Serial.printf("Fetch error: HTTP %d\n", code);
+    publishLog("Fetch error: HTTP " + String(code));
   }
   http.end();
 }
@@ -617,7 +631,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   Serial.printf("MQTT [%s]: %s\n", topic, msg.c_str());
   if (String(topic) == MQTT_TOPIC_REFETCH &&
       (msg.indexOf("refetch") != -1 || msg == "1")) {
-    Serial.println("Refetch via MQTT");
+    publishLog("MQTT refetch received, fetching...");
     clearFetchDate();
     fetchedToday = false;
     fetchSchedule();
@@ -652,7 +666,7 @@ void publishSensorData(float lux, float temp, float hum) {
      "\"timestamp\":\"%s\"}",
     TARGET_CLASSROOM,
     projectorOn ? "ON" : "OFF",
-    presenceFound ? "true" : "false",
+    presenceNow ? "true" : "false",
     lux, temp, hum,
     getTimestamp().c_str());
   mqttClient.publish(MQTT_TOPIC_SENSOR, payload);
@@ -666,6 +680,7 @@ void setup() {
   Serial.begin(115200);
   delay(1000);
 
+  // LED nyala saat boot = sedang proses
   pinMode(PIN_LED_NTP,  OUTPUT); digitalWrite(PIN_LED_NTP,  HIGH);
   pinMode(PIN_LED_WIFI, OUTPUT); digitalWrite(PIN_LED_WIFI, HIGH);
 
@@ -697,23 +712,21 @@ void setup() {
 
   Serial.printf("Ready | %s | Room: %s\n",
     DEBUG_MODE ? "DEBUG" : "PRODUCTION", TARGET_CLASSROOM);
-  Serial.printf("Lux threshold:%.0f | IR retry:%lus x%d\n",
-    LUX_THRESHOLD, IR_SEND_INTERVAL / 1000, IR_MAX_RETRY);
-  Serial.printf("Presence:%s threshold:%d timeout:%dmin check:%lus\n",
-    ENABLE_PRESENCE ? "ON" : "OFF",
-    PRESENCE_ENERGY_THRESHOLD, PRESENCE_TIMEOUT_MIN,
+  Serial.printf("Lux:%.0f | IR:%lus x%d | Presence:%s\n",
+    LUX_THRESHOLD, IR_SEND_INTERVAL / 1000, IR_MAX_RETRY,
+    ENABLE_PRESENCE ? "ON" : "OFF");
+  Serial.printf("Start window:%dmin | End window:%dmin | Check:%lus\n",
+    PRESENCE_TIMEOUT_MIN, END_WINDOW_TIMEOUT_MIN,
     PRESENCE_CHECK_INTERVAL / 1000);
-  Serial.printf("NTP retry:%lus resync:%lus | Lamp retry:%lus\n",
-    NTP_RETRY_INTERVAL / 1000,
-    NTP_RESYNC_INTERVAL / 1000,
-    LAMP_RETRY_INTERVAL / 1000);
 }
 
 // =====================================================================
 // LOOP
 // =====================================================================
 void loop() {
+  // Presence polling setiap loop — tidak blocking, hasil ke presenceNow
   pollPresenceSensor();
+
   maintainWiFi();
   maintainNTP();
   maintainLampUsage();
@@ -744,20 +757,21 @@ void loop() {
     float temp = aht10.readTemperature();
     float hum  = aht10.readHumidity();
 
-    // BH1750 sebagai sumber kebenaran — satu threshold
+    // BH1750 sebagai sumber kebenaran
     bool prevOn = projectorOn;
     projectorOn = (lux > LUX_THRESHOLD);
 
     if (projectorOn && !prevOn) {
       lampOnStart = millis();
-      Serial.printf("Projector ON (lux=%.1f)\n", lux);
+      publishLog("Projector ON confirmed (lux=" + String(lux, 1) + ")");
     }
     if (!projectorOn && prevOn && lampOnStart > 0) {
       uint32_t sessionMin = (millis() - lampOnStart) / 60000UL;
       lampTodayMin += sessionMin;
       lampOnStart   = 0;
-      Serial.printf("Projector OFF (lux=%.1f) session=%umin today=%umin\n",
-        lux, sessionMin, lampTodayMin);
+      publishLog("Projector OFF confirmed (lux=" + String(lux, 1) +
+                 ") session=" + String(sessionMin) + "min today=" +
+                 String(lampTodayMin) + "min");
     }
 
     // Verifikasi IR pending
@@ -765,25 +779,26 @@ void loop() {
       bool confirmed = irTargetOn ? (lux > LUX_THRESHOLD)
                                   : (lux <= LUX_THRESHOLD);
       if (confirmed) {
-        Serial.printf("IR %s confirmed (lux=%.1f)\n",
-          irTargetOn ? "ON" : "OFF", lux);
         irSending = false;
+        publishLog("IR " + String(irTargetOn ? "ON" : "OFF") +
+                   " confirmed (lux=" + String(lux, 1) + ")");
       } else if (millis() - irLastSent >= IR_SEND_INTERVAL) {
         irRetryCount++;
         if (irRetryCount >= IR_MAX_RETRY) {
           irSending = false;
-          Serial.printf("IR %s failed after %d retries\n",
-            irTargetOn ? "ON" : "OFF", IR_MAX_RETRY);
+          publishLog("IR " + String(irTargetOn ? "ON" : "OFF") +
+                     " failed after " + String(IR_MAX_RETRY) + " retries");
         } else {
-          Serial.printf("IR %s retry %d/%d (lux=%.1f)\n",
-            irTargetOn ? "ON" : "OFF", irRetryCount, IR_MAX_RETRY, lux);
+          publishLog("IR " + String(irTargetOn ? "ON" : "OFF") +
+                     " retry " + String(irRetryCount) + "/" +
+                     String(IR_MAX_RETRY) + " (lux=" + String(lux, 1) + ")");
           if (irTargetOn) sendIROn(); else sendIROff();
           irLastSent = millis();
         }
       }
     }
 
-    // Buffer sensor — hanya saat proyektor ON
+    // Buffer sensor (hanya saat proyektor ON)
     if (projectorOn && !isnan(temp) && !isnan(hum)) {
       tempBuffer[bufferIdx] = temp;
       humBuffer[bufferIdx]  = hum;
@@ -792,67 +807,128 @@ void loop() {
         insertSensorAverage();
     }
 
-    Serial.printf("lux=%.1f temp=%.1f hum=%.1f proj=%s today=%umin\n",
+    Serial.printf("lux=%.1f temp=%.1f hum=%.1f proj=%s presence=%s today=%umin\n",
       lux, temp, hum,
-      projectorOn ? "ON" : "OFF", lampTodayMin);
+      projectorOn ? "ON" : "OFF",
+      presenceNow ? "YES" : "NO",
+      lampTodayMin);
 
     if (!isnan(temp) && !isnan(hum))
       publishSensorData(lux, temp, hum);
   }
 
   // ---------------------------------------------------------------
-  // LOGIKA JADWAL + PRESENCE (tiap detik)
+  // LOGIKA JADWAL (tiap detik)
   // ---------------------------------------------------------------
   if (timeSync && !schedules.empty()) {
+
     for (const auto& s : schedules) {
-      if (isTimeMatch(s.start_time) && !presenceWindowActive && !projectorOn) {
-        Serial.printf("Start: %s | Opening presence window\n",
-          s.mata_kuliah.c_str());
-        presenceWindowActive = true;
-        presenceFound        = false;
-        presenceWindowStart  = millis();
-        lastPresenceCheck    = 0;
+
+      // === START TIME ===
+      // Buka start window jika:
+      // - waktu cocok dengan start_time
+      // - belum ada window yang aktif
+      // - proyektor belum ON (kalau sudah ON, skip — jadwal sebelumnya masih jalan)
+      if (isTimeMatch(s.start_time) && !startWindowActive &&
+          !endWindowActive && !projectorOn) {
+        publishLog("Start window opened: " + s.mata_kuliah +
+                   " (" + s.start_time + ")");
+        startWindowActive = true;
+        startWindowStart  = millis();
+        lastStartCheck    = 0;  // langsung cek di iterasi pertama
         break;
       }
 
-      if (isTimeMatch(s.end_time)) {
-        Serial.printf("End: %s | IR OFF\n", s.mata_kuliah.c_str());
-        presenceWindowActive = false;
-        presenceFound        = false;
-        if (projectorOn || irSending) startIROff();
-        if (s.end_time == getLastEndTime() && !pendingUpsert) {
-          pendingUpsert = true;
-          Serial.println("Last schedule, pending lamp update");
-        }
-        delay(1000);
+      // === END TIME ===
+      // Buka end window saat end_time
+      if (isTimeMatch(s.end_time) && !endWindowActive) {
+        publishLog("End window opened: " + s.mata_kuliah +
+                   " (" + s.end_time + ") checking presence...");
+        endWindowActive  = true;
+        endWindowStart   = millis();
+        lastEndCheck     = 0;  // langsung cek di iterasi pertama
+        startWindowActive = false;  // tutup start window jika masih aktif
         break;
       }
     }
 
-    if (presenceWindowActive && !presenceFound && !projectorOn) {
-      unsigned long elapsed = millis() - presenceWindowStart;
+    // === PROSES START WINDOW ===
+    if (startWindowActive && !projectorOn) {
+      unsigned long elapsed = millis() - startWindowStart;
+
+      // Timeout — tidak ada orang setelah 15 menit
       if (elapsed > (unsigned long)PRESENCE_TIMEOUT_MIN * 60000UL) {
-        presenceWindowActive = false;
-        Serial.printf("Presence timeout (%d min)\n", PRESENCE_TIMEOUT_MIN);
-      } else if (millis() - lastPresenceCheck >= PRESENCE_CHECK_INTERVAL) {
-        lastPresenceCheck = millis();
-        presenceFound     = readPresence();
-        if (presenceFound) {
-          Serial.println("Person detected, IR ON");
+        startWindowActive = false;
+        publishLog("Start window timeout (" + String(PRESENCE_TIMEOUT_MIN) +
+                   " min) no one detected");
+      }
+      // Cek presence tiap 30 detik
+      else if (millis() - lastStartCheck >= PRESENCE_CHECK_INTERVAL) {
+        lastStartCheck = millis();
+        if (presenceNow) {
+          publishLog("Presence DETECTED, sending IR ON");
           startIROn();
-          presenceWindowActive = false;
+          startWindowActive = false;
         } else {
-          unsigned long rem = ((unsigned long)PRESENCE_TIMEOUT_MIN * 60000UL - elapsed) / 1000;
-          Serial.printf("No presence, retry in %lus (%lus remaining)\n",
-            PRESENCE_CHECK_INTERVAL / 1000, rem);
+          unsigned long rem = ((unsigned long)PRESENCE_TIMEOUT_MIN * 60000UL
+                               - elapsed) / 1000;
+          publishLog("Presence EMPTY, retry in " +
+                     String(PRESENCE_CHECK_INTERVAL / 1000) +
+                     "s (" + String(rem) + "s remaining)");
         }
       }
     }
 
+    // === PROSES END WINDOW ===
+    if (endWindowActive) {
+      unsigned long elapsed = millis() - endWindowStart;
+
+      // Timeout — matikan paksa setelah 15 menit apapun kondisinya
+      if (elapsed > (unsigned long)END_WINDOW_TIMEOUT_MIN * 60000UL) {
+        endWindowActive = false;
+        publishLog("End window timeout (" + String(END_WINDOW_TIMEOUT_MIN) +
+                   " min) forcing IR OFF");
+        if (projectorOn || irSending) startIROff();
+
+        // Tandai upsert jika jadwal terakhir
+        // Cek semua jadwal — apakah end_time yang memicu ini adalah yang terakhir
+        for (const auto& s : schedules) {
+          if (s.end_time == getLastEndTime() && !pendingUpsert) {
+            pendingUpsert = true;
+            publishLog("Last schedule ended, pending lamp update");
+          }
+        }
+      }
+      // Cek presence tiap 30 detik
+      else if (millis() - lastEndCheck >= PRESENCE_CHECK_INTERVAL) {
+        lastEndCheck = millis();
+        if (!presenceNow) {
+          // Tidak ada orang → matikan proyektor
+          endWindowActive = false;
+          publishLog("Presence EMPTY, sending IR OFF");
+          if (projectorOn || irSending) startIROff();
+
+          // Tandai upsert jika jadwal terakhir
+          for (const auto& s : schedules) {
+            if (s.end_time == getLastEndTime() && !pendingUpsert) {
+              pendingUpsert = true;
+              publishLog("Last schedule ended, pending lamp update");
+            }
+          }
+        } else {
+          unsigned long rem = ((unsigned long)END_WINDOW_TIMEOUT_MIN * 60000UL
+                               - elapsed) / 1000;
+          publishLog("Presence DETECTED, extending (" +
+                     String(rem) + "s until forced OFF)");
+        }
+      }
+    }
+
+    // === LAMP USAGE UPDATE setelah proyektor OFF ===
     if (pendingUpsert && !projectorOn && !irSending) {
       upsertLampUsage();
       pendingUpsert = false;
-      Serial.println("Day complete, waiting for tomorrow");
+      publishLog("Day complete, waiting for tomorrow");
     }
   }
 
