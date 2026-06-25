@@ -25,9 +25,11 @@
 // =====================================================================
 // TUNING
 // =====================================================================
-#define LUX_THRESHOLD             220.0f
+#define LUX_THRESHOLD_DEFAULT     210.0f   // default jika EEPROM kosong
+#define LUX_CALIBRATE_OFFSET      10.0f    // tambah 10 saat kalibrasi
+#define PRESENCE_MAX_DISTANCE     400      // batas deteksi maksimal (cm)
 
-#define IR_SEND_INTERVAL          15000UL
+#define IR_SEND_INTERVAL          30000UL  // interval antar IR send (ms)
 #define IR_MAX_RETRY              5
 
 // Set 1 = presence aktif, 0 = dinonaktifkan (troubleshoot)
@@ -44,7 +46,7 @@
 // =====================================================================
 // NTP
 // =====================================================================
-#define NTP_RETRY_INTERVAL        30000UL 
+#define NTP_RETRY_INTERVAL        60000UL
 #define NTP_RESYNC_INTERVAL       3600000UL
 
 // =====================================================================
@@ -55,12 +57,8 @@
 // =====================================================================
 // WiFi
 // =====================================================================
-// const char* SSID     = "CEIOT";
-// const char* PASSWORD = "CE-1OT@!";
-
-const char* SSID     = "Felio";
-const char* PASSWORD = "felio150";
-
+const char* SSID     = "CEIOT";
+const char* PASSWORD = "CE-1OT@!";
 
 // =====================================================================
 // SUPABASE
@@ -70,16 +68,17 @@ const char* SUPABASE_API_KEY = "sb_publishable_9AcAocwpvzIqNdhlP05Jtg_U4PK63gT";
 const char* TABLE_SCHEDULE   = "tbl_jadwalkelas";
 const char* TABLE_LAMPUSAGE  = "tbl_lampusage";
 const char* TABLE_SENSORDATA = "tbl_dataprojector";
-const char* TARGET_CLASSROOM = "HD03";
+const char* TARGET_CLASSROOM = "HD04";
 
 // =====================================================================
 // MQTT
 // =====================================================================
 const char* MQTT_BROKER        = "broker.emqx.io";
 const int   MQTT_PORT          = 1883;
-const char* MQTT_TOPIC_SENSOR  = "sensor/data/thesis";
-const char* MQTT_TOPIC_LOG     = "thesis/log";
-const char* MQTT_TOPIC_REFETCH = "thesis/refetch_schedule";
+const char* MQTT_TOPIC_SENSOR    = "sensor/data/thesis";
+const char* MQTT_TOPIC_LOG       = "thesis/log";
+const char* MQTT_TOPIC_REFETCH   = "thesis/refetch_schedule";
+const char* MQTT_TOPIC_CALIBRATE = "thesis/calibrate_lux_value";
 
 // =====================================================================
 // NTP CONFIG
@@ -92,10 +91,12 @@ const int   DAYLIGHT_OFFSET = 0;
 // EEPROM LAYOUT
 // Addr 0-10  : fetch date "YYYY-MM-DD\0" (11 byte)
 // Addr 12-15 : lamp baseline menit uint32_t (4 byte)
+// Addr 16-19 : lux threshold float (4 byte)
 // =====================================================================
 #define EEPROM_SIZE          512
 #define EEPROM_ADDR_DATE     0
 #define EEPROM_ADDR_LAMP     12
+#define EEPROM_ADDR_LUX      16
 #define FETCH_RETRY_INTERVAL 600000UL
 
 // =====================================================================
@@ -144,6 +145,9 @@ bool          irSending        = false;
 bool          irTargetOn       = false;
 int           irRetryCount     = 0;
 unsigned long irLastSent       = 0;
+
+// Lux threshold — bisa diubah via MQTT calibrate, disimpan ke EEPROM
+float         luxThreshold     = LUX_THRESHOLD_DEFAULT;
 
 // Presence — polling terus, hasil selalu fresh
 bool          presenceNow      = false;  // status terkini dari poll
@@ -227,12 +231,12 @@ String getLastEndTime() {
 }
 
 void setLED(uint8_t pin, bool problem) {
-  // LED nyala = ada masalah (active LOW)
+  // LED nyala = ada masalah (active HIGH: GPIO→resistor→LED→GND)
   digitalWrite(pin, problem ? HIGH : LOW);
 }
 
 // =====================================================================
-// MQTT LOG 
+// MQTT LOG — kirim event penting ke topic thesis/log
 // =====================================================================
 void publishLog(const String& msg) {
   if (!mqttClient.connected()) {
@@ -276,6 +280,19 @@ void saveLampBaseline(uint32_t minutes) {
 uint32_t loadLampBaseline() {
   uint32_t val = 0;
   EEPROM.get(EEPROM_ADDR_LAMP, val);
+  return val;
+}
+
+void saveLuxThreshold(float value) {
+  EEPROM.put(EEPROM_ADDR_LUX, value);
+  EEPROM.commit();
+}
+
+float loadLuxThreshold() {
+  float val = 0;
+  EEPROM.get(EEPROM_ADDR_LUX, val);
+  // Kalau nilai tidak valid (EEPROM baru/kosong), pakai default
+  if (isnan(val) || val <= 0 || val > 10000) return LUX_THRESHOLD_DEFAULT;
   return val;
 }
 
@@ -378,7 +395,8 @@ void maintainNTP() {
 }
 
 // =====================================================================
-// HUMAN PRESENCE SENSOR
+// PRESENCE SENSOR
+// Poll setiap loop → hasil disimpan ke presenceNow (tidak blocking)
 // =====================================================================
 void initPresenceSensor() {
 #if ENABLE_PRESENCE
@@ -395,10 +413,18 @@ void pollPresenceSensor() {
 #if ENABLE_PRESENCE
   presenceSensor.read();
   if (presenceSensor.presenceDetected()) {
-    uint8_t movE  = presenceSensor.movingTargetEnergy();
-    uint8_t statE = presenceSensor.stationaryTargetEnergy();
-    presenceNow = (movE > PRESENCE_ENERGY_THRESHOLD) ||
-                  (statE > PRESENCE_ENERGY_THRESHOLD);
+    uint8_t  movE     = presenceSensor.movingTargetEnergy();
+    uint8_t  statE    = presenceSensor.stationaryTargetEnergy();
+    uint16_t movDist  = presenceSensor.movingTargetDistance();
+    uint16_t statDist = presenceSensor.stationaryTargetDistance();
+
+    // Filter jarak — abaikan deteksi di luar PRESENCE_MAX_DISTANCE (400cm)
+    bool movInRange  = (movE  > PRESENCE_ENERGY_THRESHOLD) &&
+                       (movDist  > 0) && (movDist  <= PRESENCE_MAX_DISTANCE);
+    bool statInRange = (statE > PRESENCE_ENERGY_THRESHOLD) &&
+                       (statDist > 0) && (statDist <= PRESENCE_MAX_DISTANCE);
+
+    presenceNow = movInRange || statInRange;
   } else {
     presenceNow = false;
   }
@@ -420,7 +446,7 @@ void sendIROff() {
   irsend.sendNEC(IR_CODE_1, 32);
   delay(100);
   irsend.sendNEC(IR_CODE_2, 32);
-  delay(4000);
+  delay(2500);
   irsend.sendNEC(IR_CODE_1, 32);
   delay(100);
   irsend.sendNEC(IR_CODE_2, 32);
@@ -629,12 +655,30 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   String msg = "";
   for (unsigned int i = 0; i < length; i++) msg += (char)payload[i];
   Serial.printf("MQTT [%s]: %s\n", topic, msg.c_str());
+
+  // Refetch jadwal
   if (String(topic) == MQTT_TOPIC_REFETCH &&
       (msg.indexOf("refetch") != -1 || msg == "1")) {
     publishLog("MQTT refetch received, fetching...");
     clearFetchDate();
     fetchedToday = false;
     fetchSchedule();
+  }
+
+  // Kalibrasi lux threshold
+  // ESP ambil nilai lux sekarang + 10, simpan ke EEPROM
+  if (String(topic) == MQTT_TOPIC_CALIBRATE &&
+      (msg.indexOf("calibrate") != -1 || msg == "1")) {
+    float currentLux = lightMeter.readLightLevel();
+    if (currentLux > 0) {
+      luxThreshold = currentLux + LUX_CALIBRATE_OFFSET;
+      saveLuxThreshold(luxThreshold);
+      publishLog("Lux calibrated: raw=" + String(currentLux, 1) +
+                 " threshold=" + String(luxThreshold, 1) +
+                 " (+" + String(LUX_CALIBRATE_OFFSET, 0) + ")");
+    } else {
+      publishLog("Lux calibration failed: sensor read error");
+    }
   }
 }
 
@@ -645,6 +689,7 @@ void connectMQTT() {
     String id = "ESP32C3-" + String(random(0xffff), HEX);
     if (mqttClient.connect(id.c_str())) {
       mqttClient.subscribe(MQTT_TOPIC_REFETCH);
+      mqttClient.subscribe(MQTT_TOPIC_CALIBRATE);
       Serial.println("MQTT connected");
     } else {
       delay(2000);
@@ -680,13 +725,17 @@ void setup() {
   Serial.begin(115200);
   delay(1000);
 
-  // LED nyala saat boot = sedang proses
+  // LED nyala saat boot = sedang proses (active HIGH)
   pinMode(PIN_LED_NTP,  OUTPUT); digitalWrite(PIN_LED_NTP,  HIGH);
   pinMode(PIN_LED_WIFI, OUTPUT); digitalWrite(PIN_LED_WIFI, HIGH);
 
   EEPROM.begin(EEPROM_SIZE);
   Wire.begin(PIN_SDA, PIN_SCL);
   irsend.begin();
+
+  // Load lux threshold dari EEPROM (kalau sudah pernah dikalibrasi)
+  luxThreshold = loadLuxThreshold();
+  Serial.printf("Lux threshold loaded: %.1f\n", luxThreshold);
 
   lightMeter.begin(BH1750::CONTINUOUS_HIGH_RES_MODE, 0x23, &Wire);
   aht10.begin();
@@ -713,7 +762,7 @@ void setup() {
   Serial.printf("Ready | %s | Room: %s\n",
     DEBUG_MODE ? "DEBUG" : "PRODUCTION", TARGET_CLASSROOM);
   Serial.printf("Lux:%.0f | IR:%lus x%d | Presence:%s\n",
-    LUX_THRESHOLD, IR_SEND_INTERVAL / 1000, IR_MAX_RETRY,
+    luxThreshold, IR_SEND_INTERVAL / 1000, IR_MAX_RETRY,
     ENABLE_PRESENCE ? "ON" : "OFF");
   Serial.printf("Start window:%dmin | End window:%dmin | Check:%lus\n",
     PRESENCE_TIMEOUT_MIN, END_WINDOW_TIMEOUT_MIN,
@@ -759,7 +808,7 @@ void loop() {
 
     // BH1750 sebagai sumber kebenaran
     bool prevOn = projectorOn;
-    projectorOn = (lux > LUX_THRESHOLD);
+    projectorOn = (lux > luxThreshold);
 
     if (projectorOn && !prevOn) {
       lampOnStart = millis();
@@ -776,8 +825,8 @@ void loop() {
 
     // Verifikasi IR pending
     if (irSending) {
-      bool confirmed = irTargetOn ? (lux > LUX_THRESHOLD)
-                                  : (lux <= LUX_THRESHOLD);
+      bool confirmed = irTargetOn ? (lux > luxThreshold)
+                                  : (lux <= luxThreshold);
       if (confirmed) {
         irSending = false;
         publishLog("IR " + String(irTargetOn ? "ON" : "OFF") +
